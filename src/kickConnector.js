@@ -24,7 +24,7 @@ async function startKickConnector({ pool, channel, onMessage, clientId, clientSe
   let chatroomId = null;
   let channelId = null;
   try {
-    const res = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`, { timeout: 10000 });
+    const res = await axios.get(   `https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`,   {     timeout: 10000,     headers: {       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',       'Accept': 'application/json',       'Content-Type': 'application/json'     }   } );
     const data = res.data?.data;
     chatroomId = data?.chatroom?.id;
     channelId = data?.id ?? data?.channel_id ?? null;
