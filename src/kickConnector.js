@@ -1,7 +1,6 @@
 // src/kickConnector.js
 'use strict';
 
-const axios = require('axios');
 const WebSocket = require('ws');
 
 const PUSHER_WS =
@@ -12,18 +11,8 @@ let stopped = false;
 let args = null;
 let attempts = 0;
 
-function headers() {
-  return { 'User-Agent': 'Mozilla/5.0 (KickBot/1.0)', Accept: 'application/json' };
-}
-
 function jparse(x) {
   try { return JSON.parse(x); } catch (e) { return null; }
-}
-
-async function getChannel(channel) {
-  const url = `https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`;
-  const res = await axios.get(url, { headers: headers(), timeout: 15000 });
-  return res && res.data && res.data.data ? res.data.data : null;
 }
 
 function cleanup() {
@@ -99,26 +88,25 @@ function connect(a) {
   });
 }
 
+/**
+ * Kick-safe connector: requires chatroomId from DB/env (no Kick HTTP calls).
+ *
+ * options:
+ * - chatroomId (required)
+ * - channelId (optional)
+ * - onMessage (function)
+ */
 async function startKickConnector(options) {
-  const channel = options && options.channel ? options.channel : '';
+  const chatroomId = Number(options && options.chatroomId);
+  const channelId = options && options.channelId ? Number(options.channelId) : null;
   const onMessage = options && options.onMessage ? options.onMessage : null;
 
-  if (!channel) {
-    console.log('KICK_CHANNEL not set; Kick connector will not start.');
-    return null;
-  }
-
-  const info = await getChannel(channel);
-  const chatroomId = info && info.chatroom ? info.chatroom.id : null;
-  const channelId = info && info.id ? info.id : null;
-
-  if (!chatroomId) {
-    throw new Error(`Could not determine chatroom id for channel: ${channel}`);
+  if (!chatroomId || !Number.isFinite(chatroomId)) {
+    throw new Error('Missing chatroomId (store it in Postgres tokens table as kick:chatroom_id)');
   }
 
   stopped = false;
   connect({ chatroomId: chatroomId, channelId: channelId, onMessage: onMessage });
-
   return { stop: stopKickConnector };
 }
 
