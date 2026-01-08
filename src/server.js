@@ -243,3 +243,53 @@ main().catch(err => {
   console.error('Fatal startup error', err);
   process.exit(1);
 });
+
+// OAuth routes
+app.get('/kick/auth', (req, res) => {
+const params = new URLSearchParams({
+client_id: process.env.CLIENT_ID,
+redirect_uri: process.env.REDIRECT_URI,
+response_type: 'code',
+scope: 'chat:write chat:read'
+});
+
+
+res.redirect(`https://id.kick.com/oauth/authorize?${params}`);
+});
+
+
+app.get('/kick/callback', async (req, res) => {
+const code = req.query.code;
+if (!code) return res.status(400).send('Missing code');
+
+
+const params = new URLSearchParams({
+grant_type: 'authorization_code',
+client_id: process.env.CLIENT_ID,
+client_secret: process.env.CLIENT_SECRET,
+redirect_uri: process.env.REDIRECT_URI,
+code
+});
+
+
+const resp = await axios.post(
+'https://id.kick.com/oauth/token',
+params.toString(),
+{ headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+);
+
+
+const { access_token, refresh_token, expires_in } = resp.data;
+
+
+await tokenManager.setTokenValue(pool, 'kick:access_token', access_token);
+await tokenManager.setTokenValue(pool, 'kick:refresh_token', refresh_token);
+await tokenManager.setTokenValue(
+pool,
+'kick:access_expires_at',
+new Date(Date.now() + expires_in * 1000).toISOString()
+);
+
+
+res.send('Kick bot authorized. You can close this tab.');
+});
