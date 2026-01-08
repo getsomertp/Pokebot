@@ -1,19 +1,22 @@
 /**
- * src/server.js — Railway-safe Kick Pokémon Bot (copy/paste full file)
+ * src/server.js — Kick-safe long-term (Railway)
  *
- * What this version does:
- * - Fixes your crash (no routes defined outside app scope)
- * - Keeps /kick/auth and /kick/callback working
- * - Uses WebSocket connector for READING chat (auto-reconnect handled in kickConnector.js)
- * - Uses HTTP send queue for WRITING chat (rate-limit + retry + token refresh)
- * - Caches chatroom_id in Postgres to avoid repeated channel lookups
+ * Key changes vs your current file:
+ * - NO boot-time Kick channel fetch (Kick blocks Railway IPs with 403)
+ * - Kick WS connector uses chatroomId/channelId from Postgres tokens table:
+ *     kick:chatroom_id  (required for WS)
+ *     kick:channel_id   (optional)
+ * - Adds admin endpoint to set those values once:
+ *     POST /admin/set-chatroom
  *
  * Required env vars on Railway:
- * - DATABASE_URL (from Railway Postgres)
- * - PORT (Railway sets this automatically)
- * - BOT_ADMIN_SECRET (set a random string)
+ * - DATABASE_URL
+ * - PORT (Railway sets)
+ * - BOT_ADMIN_SECRET
  * - CLIENT_ID, CLIENT_SECRET, REDIRECT_URI (Kick OAuth)
- * - KICK_CHANNEL (streamer username)
+ *
+ * Optional env vars:
+ * - KICK_CHANNEL (used only for convenience messaging + optional priming; not required for WS anymore)
  */
 
 'use strict';
@@ -36,11 +39,10 @@ const BOT_ADMIN_SECRET = process.env.BOT_ADMIN_SECRET || 'dev_secret';
 const CLIENT_ID = process.env.CLIENT_ID || '';
 const CLIENT_SECRET = process.env.CLIENT_SECRET || '';
 const REDIRECT_URI = process.env.REDIRECT_URI || '';
-const KICK_CHANNEL = process.env.KICK_CHANNEL || '';
+const KICK_CHANNEL = process.env.KICK_CHANNEL || ''; // optional now
 
 const oauthStateStore = new Map();
 
-/** Kick tends to dislike “unknown” clients from cloud IPs; set a stable UA */
 function kickHeaders() {
   return {
     'User-Agent': 'Mozilla/5.0 (KickBot/1.0)',
@@ -54,47 +56,33 @@ function kickHeaders() {
  * - Queues messages
  * - Sends via Kick HTTP API using OAuth token
  * - Retries with backoff on 401 / 429 / transient failures
- * - Caches chatroom_id in Postgres (tokens table) to reduce Kick HTTP calls
+ * - Uses chatroom_id from DB; does NOT call /channels endpoint from Railway
  */
-function createChatSender({ pool, channel, getClientCreds }) {
+function createChatSender({ pool, getClientCreds }) {
   let sending = false;
   const q = [];
   let cachedChatroomId = null;
 
-  async function getChatroomId() {
+  async function getChatroomIdFromDB() {
     if (cachedChatroomId) return cachedChatroomId;
 
-    // Try DB cache first
     const cached = await pool.query(
       `SELECT value FROM tokens WHERE key = $1`,
       ['kick:chatroom_id']
     );
-    if (cached.rowCount) {
-      const v = Number(cached.rows[0].value);
-      if (Number.isFinite(v) && v > 0) {
-        cachedChatroomId = v;
-        return cachedChatroomId;
-      }
+
+    if (!cached.rowCount) {
+      throw new Error(
+        'Missing kick:chatroom_id in DB. Set it via POST /admin/set-chatroom.'
+      );
     }
 
-    // One-time fallback: fetch channel info (may be blocked on some cloud IPs)
-    const res = await axios.get(
-      `https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`,
-      { headers: kickHeaders(), timeout: 15000 }
-    );
+    const v = Number(cached.rows[0].value);
+    if (!Number.isFinite(v) || v <= 0) {
+      throw new Error('kick:chatroom_id in DB is not a valid number.');
+    }
 
-    const id = res.data?.data?.chatroom?.id;
-    if (!id) throw new Error('Could not determine Kick chatroom id (Kick blocked or channel not found).');
-
-    cachedChatroomId = Number(id);
-
-    // Store to DB
-    await pool.query(
-      `INSERT INTO tokens (key,value) VALUES ($1,$2)
-       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
-      ['kick:chatroom_id', String(cachedChatroomId)]
-    );
-
+    cachedChatroomId = v;
     return cachedChatroomId;
   }
 
@@ -103,7 +91,7 @@ function createChatSender({ pool, channel, getClientCreds }) {
     const accessToken = await tokenManager.getValidAccessToken(pool, clientId, clientSecret);
     if (!accessToken) throw new Error('No access token available for chat send.');
 
-    const chatroomId = await getChatroomId();
+    const chatroomId = await getChatroomIdFromDB();
     const postUrl = `https://kick.com/api/v2/chat/${chatroomId}/message`;
 
     const resp = await axios.post(
@@ -116,7 +104,6 @@ function createChatSender({ pool, channel, getClientCreds }) {
       }
     );
 
-    // Handle common failure modes
     if (resp.status === 429) {
       const retryAfter = Number(resp.headers?.['retry-after'] ?? 2);
       const waitMs = Math.min(10000, Math.max(1000, retryAfter * 1000));
@@ -125,13 +112,13 @@ function createChatSender({ pool, channel, getClientCreds }) {
     }
 
     if (resp.status === 401) {
-      // Force refresh and retry
       await tokenManager.refreshAccessToken(pool, clientId, clientSecret);
       throw new Error('unauthorized_retry');
     }
 
     if (resp.status < 200 || resp.status >= 300) {
-      const body = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data ?? {});
+      const body =
+        typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data ?? {});
       throw new Error(`kick_send_failed_${resp.status}:${body.slice(0, 200)}`);
     }
 
@@ -147,7 +134,6 @@ function createChatSender({ pool, channel, getClientCreds }) {
         const msg = q.shift();
         if (!msg) continue;
 
-        // Retry up to 3 times with exponential backoff
         let attempts = 0;
         while (attempts < 3) {
           attempts += 1;
@@ -164,7 +150,6 @@ function createChatSender({ pool, channel, getClientCreds }) {
           }
         }
 
-        // Small spacing to reduce rate-limit chance
         await new Promise((r) => setTimeout(r, 350));
       }
     } finally {
@@ -175,19 +160,9 @@ function createChatSender({ pool, channel, getClientCreds }) {
   return {
     send(text) {
       if (!text) return false;
-      // Keep messages short/safe
       q.push(String(text).slice(0, 300));
       pump();
       return true;
-    },
-    async primeChatroomId() {
-      try {
-        await getChatroomId();
-        return true;
-      } catch (e) {
-        console.warn('Unable to prime chatroom id:', e?.message ?? e);
-        return false;
-      }
     },
     clearChatroomIdCache() {
       cachedChatroomId = null;
@@ -209,7 +184,6 @@ async function main() {
 
   await engine.ensureSamplePokemon();
 
-  // Start periodic refresh; it will warn until OAuth is completed (refresh token exists)
   const stopRefreshScheduler = tokenManager.schedulePeriodicRefresh(
     pool,
     CLIENT_ID,
@@ -219,15 +193,51 @@ async function main() {
   const app = express();
   app.use(bodyParser.json());
 
-  // Chat sender (HTTP) used by both the websocket handler and admin endpoints
   const chatSender = createChatSender({
     pool,
-    channel: KICK_CHANNEL,
     getClientCreds: () => ({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET }),
   });
 
-  // Health
   app.get('/health', (req, res) => res.json({ ok: true }));
+
+  /**
+   * One-time setup endpoint:
+   * Store Kick chatroomId (required) and optional channelId in Postgres.
+   *
+   * Call it like:
+   * POST /admin/set-chatroom
+   * Header: x-admin-secret: <BOT_ADMIN_SECRET>
+   * JSON: { "chatroomId": 123456, "channelId": 78910 }
+   */
+  app.post('/admin/set-chatroom', async (req, res) => {
+    const secret = req.headers['x-admin-secret'] || req.body?.secret;
+    if (secret !== BOT_ADMIN_SECRET) return res.status(403).json({ error: 'forbidden' });
+
+    const chatroomId = Number(req.body?.chatroomId);
+    const channelId = req.body?.channelId ? Number(req.body.channelId) : null;
+
+    if (!chatroomId || !Number.isFinite(chatroomId)) {
+      return res.status(400).json({ error: 'chatroomId is required (number)' });
+    }
+
+    await pool.query(
+      `INSERT INTO tokens (key,value) VALUES ($1,$2)
+       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
+      ['kick:chatroom_id', String(chatroomId)]
+    );
+
+    if (channelId && Number.isFinite(channelId)) {
+      await pool.query(
+        `INSERT INTO tokens (key,value) VALUES ($1,$2)
+         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
+        ['kick:channel_id', String(channelId)]
+      );
+    }
+
+    chatSender.clearChatroomIdCache();
+
+    res.json({ ok: true, chatroomId, channelId: channelId || null });
+  });
 
   // ---------- Admin endpoints ----------
   app.post('/admin/spawn', async (req, res) => {
@@ -313,7 +323,6 @@ async function main() {
 
     if (!code || !state) return res.status(400).send('Missing code or state');
     if (!oauthStateStore.has(state)) return res.status(400).send('Invalid state');
-
     oauthStateStore.delete(state);
 
     if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) {
@@ -347,19 +356,14 @@ async function main() {
       }
 
       await tokenManager.setTokenValue(pool, 'kick:access_token', data.access_token);
-      if (data.refresh_token) {
-        await tokenManager.setTokenValue(pool, 'kick:refresh_token', data.refresh_token);
-      }
+      if (data.refresh_token) await tokenManager.setTokenValue(pool, 'kick:refresh_token', data.refresh_token);
 
-      const expiresAt = new Date(
-        Date.now() + Number(data.expires_in || 3600) * 1000
-      ).toISOString();
+      const expiresAt = new Date(Date.now() + Number(data.expires_in || 3600) * 1000).toISOString();
       await tokenManager.setTokenValue(pool, 'kick:access_expires_at', expiresAt);
 
-      // Optional: prime cached chatroom id after auth (best effort)
-      if (KICK_CHANNEL) await chatSender.primeChatroomId();
-
-      res.send('Kick authorization successful. You can close this window.');
+      res.send(
+        'Kick authorization successful. Now set chatroomId via POST /admin/set-chatroom (see README/notes).'
+      );
     } catch (err) {
       console.error('OAuth token exchange failed', err?.response?.data ?? err?.message ?? err);
       res.status(500).send('OAuth token exchange failed. Check server logs.');
@@ -367,20 +371,36 @@ async function main() {
   });
 
   // ---------- Kick chat (read via websocket) ----------
-  if (KICK_CHANNEL) {
-    try {
+  // Kick-safe: use DB-stored chatroomId/channelId; no Kick HTTP calls from Railway
+  try {
+    const chatroomRow = await pool.query(
+      `SELECT value FROM tokens WHERE key = $1`,
+      ['kick:chatroom_id']
+    );
+    const channelRow = await pool.query(
+      `SELECT value FROM tokens WHERE key = $1`,
+      ['kick:channel_id']
+    );
+
+    const chatroomId = chatroomRow.rowCount ? Number(chatroomRow.rows[0].value) : null;
+    const channelId = channelRow.rowCount ? Number(channelRow.rows[0].value) : null;
+
+    if (!chatroomId || !Number.isFinite(chatroomId)) {
+      console.warn(
+        'Kick connector not started: missing kick:chatroom_id. Set it via POST /admin/set-chatroom.'
+      );
+    } else {
       await startKickConnector({
-        channel: KICK_CHANNEL,
+        chatroomId,
+        channelId: channelId && Number.isFinite(channelId) ? channelId : null,
         onMessage: async (username, message) => {
           await handleChatMessage({ engine, chatSender, username, message });
         },
       });
-      console.log('Kick connector started for channel:', KICK_CHANNEL);
-    } catch (err) {
-      console.warn('Kick connector not started:', err?.message ?? err);
+      console.log('Kick connector started (DB chatroomId):', chatroomId);
     }
-  } else {
-    console.log('Warning: KICK_CHANNEL not set; Kick chat connector will not start.');
+  } catch (err) {
+    console.warn('Kick connector not started:', err?.message ?? err);
   }
 
   // ---------- Spawner ----------
@@ -395,20 +415,25 @@ async function main() {
     if (!CLIENT_ID) console.log('Warning: CLIENT_ID not set; /kick/auth will not work.');
     if (!CLIENT_SECRET) console.log('Warning: CLIENT_SECRET not set; OAuth token exchange will not work.');
     if (!REDIRECT_URI) console.log('Warning: REDIRECT_URI not set; OAuth callback must match Kick app settings.');
+    if (!BOT_ADMIN_SECRET || BOT_ADMIN_SECRET === 'dev_secret') {
+      console.log('Warning: BOT_ADMIN_SECRET is default; set it on Railway for security.');
+    }
+    if (!KICK_CHANNEL) {
+      console.log('Note: KICK_CHANNEL is optional now; only needed if you want it for your own reference.');
+    }
   });
 
   process.on('SIGINT', () => {
-    try { stopRefreshScheduler && stopRefreshScheduler(); } catch {}
+    try { stopRefreshScheduler && stopRefreshScheduler(); } catch (e) {}
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
-    try { stopRefreshScheduler && stopRefreshScheduler(); } catch {}
+    try { stopRefreshScheduler && stopRefreshScheduler(); } catch (e) {}
     process.exit(0);
   });
 }
 
-/** Shared chat command handler used by both /chat stub and Kick WS */
 async function handleChatMessage({ engine, chatSender, username, message }) {
   try {
     const lower = (message ?? '').trim().toLowerCase();
@@ -431,7 +456,6 @@ async function handleChatMessage({ engine, chatSender, username, message }) {
         console.log('[BOT]', text);
         chatSender.send(text);
       }
-
       return;
     }
 
