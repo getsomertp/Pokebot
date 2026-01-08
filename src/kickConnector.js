@@ -1,90 +1,128 @@
-// kickConnector.js (ws-only wrapper, no Playwright)
+// src/kickConnector.js
+// Minimal websocket connector to Kick chat (no Playwright).
+// - Uses Kick channel API to find chatroom ID, then connects to Pusher websocket endpoint.
+// - Listens for chat messages and forwards them to onMessage(username, message, raw).
+// - Provides sendToChat(text) which prefers websocket send (if possible) else HTTP fallback using tokenManager.
+
 const axios = require('axios');
+const WebSocket = require('ws');
+const tokenManager = require('./tokenManager');
 
-let connectionInstance = null;
+let wsInstance = null;
+let wsConnected = false;
 
-/**
- * startKickConnector({ pool, channel, onMessage, clientId, clientSecret })
- *
- * - Uses @pagoru/kick_live_ws to subscribe to chat messages without Playwright.
- * - Falls back to no-op if the module isn't available.
- */
+// Known Pusher endpoint used by Kick (may change in the future)
+const PUSHER_WS = 'wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.4.0-rc2&flash=false';
+
 async function startKickConnector({ pool, channel, onMessage, clientId, clientSecret }) {
   if (!channel) {
     console.log('KICK channel not configured (KICK_CHANNEL). Kick connector will not start.');
     return null;
   }
 
-  let WebSocketConnection, MessageEvents;
+  // Step 1: fetch channel info to get chatroom id and channel id
+  let chatroomId = null;
+  let channelId = null;
   try {
-    ({ WebSocketConnection, MessageEvents } = require('@pagoru/kick_live_ws'));
+    const res = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`, { timeout: 10000 });
+    const data = res.data?.data;
+    chatroomId = data?.chatroom?.id;
+    channelId = data?.id ?? data?.channel_id ?? null;
+    if (!chatroomId) {
+      console.warn('Could not determine chatroom id for channel', channel);
+      return null;
+    }
   } catch (err) {
-    console.warn('@pagoru/kick_live_ws not available or failed to import. Kick websocket connector will not start.');
-    console.warn(err);
+    console.warn('Failed to fetch channel info from Kick API:', err?.response?.data ?? err.message);
     return null;
   }
 
-  // create connection; the constructor accepts { name: channel } or { chatroom: chatroomId }
-  const conn = new WebSocketConnection({ name: channel });
+  // Step 2: connect to pusher websocket endpoint
+  const ws = new WebSocket(PUSHER_WS, { perMessageDeflate: false });
+  wsInstance = ws;
 
-  conn.on('connected', (info) => {
-    console.log('Kick WS connector connected', info);
-  });
-
-  conn.on('error', (err) => {
-    console.error('Kick WS connector error', err);
-  });
-
-  // Message event name depends on library; expose a few fallbacks.
-  const CHAT_EVENT = MessageEvents?.CHATMESSAGE ?? 'chatMessage';
-
-  conn.on(CHAT_EVENT, (data) => {
+  ws.on('open', () => {
+    wsConnected = true;
+    console.log('Kick websocket connected.');
+    // subscribe to chatroom and channel topics
     try {
-      // try to handle several shapes from different wrapper versions
-      const username = data?.sender?.username ?? data?.username ?? data?.user ?? 'unknown';
-      const content = data?.content ?? data?.message ?? data?.text ?? '';
-      if (onMessage && typeof onMessage === 'function') onMessage(username, content, data);
+      const subscribeChatroom = { event: 'pusher:subscribe', data: { channel: `chatrooms.${chatroomId}.v2` } };
+      ws.send(JSON.stringify(subscribeChatroom));
+      if (channelId) {
+        const subscribeChannel = { event: 'pusher:subscribe', data: { channel: `channel.${channelId}` } };
+        ws.send(JSON.stringify(subscribeChannel));
+      }
     } catch (e) {
-      console.error('Error handling incoming chat message', e);
+      console.warn('Error sending subscribe messages', e);
     }
   });
 
-  try {
-    await conn.connect();
-    connectionInstance = conn;
-    console.log('Kick websocket connector started for channel', channel);
-  } catch (err) {
-    console.error('Failed to connect to Kick websocket:', err);
-    return null;
-  }
-
-  // sendToChat: try connector send methods if available, otherwise fallback to HTTP with token
-  async function sendToChat(text) {
+  ws.on('message', (msg) => {
     try {
-      if (conn && typeof conn.send === 'function') {
-        await conn.send(text);
-        return true;
+      const parsed = JSON.parse(msg.toString());
+      const event = parsed.event;
+      const data = parsed.data;
+      if (!event || !data) return;
+
+      // data may be a JSON string
+      let payload = data;
+      if (typeof data === 'string') {
+        try { payload = JSON.parse(data); } catch (e) { payload = data; }
       }
-      if (conn && typeof conn.sendMessage === 'function') {
-        await conn.sendMessage(text);
-        return true;
+
+      // Determine event type from 'event' string; try to split by backslash
+      const parts = String(event).split('\\');
+      const type = parts[2] ?? parts[1] ?? parts[0];
+
+      if (type && (type.toLowerCase().includes('chatmessage') || type.includes('ChatMessageEvent'))) {
+        // attempt to extract message and sender
+        const content = payload?.content ?? payload?.message ?? payload?.text ?? payload?.message?.content ?? payload?.body ?? '';
+        const username = payload?.sender?.username ?? payload?.user ?? payload?.displayName ?? payload?.senderUsername ?? 'unknown';
+        if (onMessage && typeof onMessage === 'function') {
+          onMessage(username, content, payload);
+        }
       }
     } catch (err) {
-      console.warn('Connector send failed, falling back to HTTP send if token available', err);
+      // ignore non-critical parse errors
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error('Kick websocket error', err);
+  });
+
+  ws.on('close', () => {
+    wsConnected = false;
+    console.log('Kick websocket closed.');
+    wsInstance = null;
+  });
+
+  // sendToChat: best-effort posting to chat (try websocket, then HTTP fallback with token)
+  async function sendToChat(text) {
+    try {
+      if (wsConnected && ws && typeof ws.send === 'function') {
+        try {
+          ws.send(JSON.stringify({ event: 'chat_msg', data: { message: text } }));
+          return true;
+        } catch (e) {
+          // try HTTP fallback
+        }
+      }
+    } catch (e) {
+      // fallback
     }
 
-    // HTTP fallback (uses Kick API and stored tokens) - try best-effort
+    // HTTP fallback using stored tokens
     try {
-      const res = await pool.query(`SELECT value FROM tokens WHERE key = $1`, ['kick:access_token']);
-      if (res.rowCount === 0) {
-        console.warn('No Kick access token found in DB; cannot send chat message.');
+      const accessToken = await tokenManager.getValidAccessToken(pool, clientId, clientSecret);
+      if (!accessToken) {
+        console.warn('No access token available for HTTP chat send.');
         return false;
       }
-      const accessToken = res.rows[0].value;
       const channelRes = await axios.get(`https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`);
       const chatroomId = channelRes.data?.data?.chatroom?.id;
       if (!chatroomId) {
-        console.warn('Could not obtain chatroom id for channel', channel);
+        console.warn('Could not obtain chatroom id for HTTP send fallback.');
         return false;
       }
       const postUrl = `https://kick.com/api/v2/chat/${chatroomId}/message`;
@@ -96,23 +134,23 @@ async function startKickConnector({ pool, channel, onMessage, clientId, clientSe
       });
       return true;
     } catch (err) {
-      console.warn('HTTP send fallback failed (Kick API may differ).', err?.response?.data ?? err.message);
+      console.warn('HTTP send fallback failed:', err?.response?.data ?? err.message);
       return false;
     }
   }
 
-  return { conn, sendToChat };
+  return { conn: ws, sendToChat };
 }
 
 async function stopKickConnector() {
   try {
-    if (connectionInstance && typeof connectionInstance.disconnect === 'function') {
-      await connectionInstance.disconnect();
+    if (wsInstance) {
+      wsInstance.close();
+      wsInstance = null;
+      wsConnected = false;
     }
   } catch (err) {
     console.warn('Error stopping Kick connector', err);
-  } finally {
-    connectionInstance = null;
   }
 }
 
