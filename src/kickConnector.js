@@ -1,80 +1,72 @@
 // src/kickConnector.js
+'use strict';
 
+const axios = require('axios');
+const WebSocket = require('ws');
 
-const content =
-payload?.content ?? payload?.message ?? payload?.text ?? payload?.body;
-const username =
-payload?.sender?.username ??
-payload?.user?.username ??
-payload?.user ??
-payload?.displayName;
+// Known Pusher endpoint used by Kick (may change in the future)
+const PUSHER_WS =
+  'wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.4.0&flash=false';
 
+let ws = null;
+let stopped = false;
+let reconnectAttempts = 0;
+let currentConnArgs = null;
 
-if (content && username && typeof onMessage === 'function') {
-onMessage(String(username), String(content), payload);
-}
-} catch {}
-});
-
-
-ws.on('close', () => {
-console.warn('Kick websocket closed');
-scheduleReconnect();
-});
-
-
-ws.on('error', (err) => {
-console.warn('Kick websocket error:', err?.message ?? err);
-try {
-ws.close();
-} catch {}
-});
-} catch (err) {
-console.warn('Kick WS connect error:', err?.message ?? err);
-scheduleReconnect();
-}
+function kickHeaders() {
+  return {
+    'User-Agent': 'Mozilla/5.0 (KickBot/1.0)',
+    Accept: 'application/json',
+  };
 }
 
-
-async function startKickConnector({ channel, onMessage }) {
-if (!channel) {
-console.log('KICK_CHANNEL not set; Kick connector will not start.');
-return null;
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    return null;
+  }
 }
 
-
-const info = await fetchChannelInfo(channel);
-const chatroomId = info?.chatroom?.id;
-const channelId = info?.id ?? null;
-
-
-if (!chatroomId) {
-throw new Error(`Could not determine chatroom id for channel: ${channel}`);
+async function fetchChannelInfo(channel) {
+  const url = `https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`;
+  const res = await axios.get(url, { headers: kickHeaders(), timeout: 15000 });
+  return res.data && res.data.data ? res.data.data : null;
 }
 
+function scheduleReconnect() {
+  if (stopped || !currentConnArgs) return;
 
-stopped = false;
-currentConnArgs = { chatroomId, channelId, onMessage };
-connectWS(currentConnArgs);
+  reconnectAttempts += 1;
 
+  // Exponential backoff with jitter, capped
+  const exp = Math.min(reconnectAttempts, 6); // cap exponent
+  const base = 1000 * Math.pow(2, exp); // 2s..64s-ish
+  const jitter = Math.floor(Math.random() * 500);
+  const delay = Math.min(30000, base + jitter);
 
-return { stop: stopKickConnector };
+  console.warn(
+    `Kick WS reconnecting in ${delay}ms (attempt ${reconnectAttempts})`
+  );
+
+  setTimeout(function () {
+    if (stopped) return;
+    connectWS(currentConnArgs);
+  }, delay);
 }
 
-
-function stopKickConnector() {
-stopped = true;
-currentConnArgs = null;
-
-
-if (ws) {
-try {
-ws.removeAllListeners();
-ws.terminate();
-} catch {}
-ws = null;
-}
+function cleanupWS() {
+  if (!ws) return;
+  try {
+    ws.removeAllListeners();
+  } catch (e) {}
+  try {
+    ws.terminate();
+  } catch (e) {}
+  ws = null;
 }
 
-
-module.exports = { startKickConnector, stopKickConnector };
+function connectWS(args) {
+  const chatroomId = args.chatroomId;
+  const channelId = args.channelId;
+  const onMessage = args.onMessage;
