@@ -410,7 +410,7 @@ async function main() {
     chatSender.send(text);
   });
 
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on ${PORT}`);
     if (!CLIENT_ID) console.log('Warning: CLIENT_ID not set; /kick/auth will not work.');
     if (!CLIENT_SECRET) console.log('Warning: CLIENT_SECRET not set; OAuth token exchange will not work.');
